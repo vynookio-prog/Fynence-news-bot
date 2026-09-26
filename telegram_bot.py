@@ -12,7 +12,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # opsional; kalau kosong, ski
 
 # Ganti nama model ini kalau suatu saat error "model not found" —
 # cek daftar model terbaru di https://ai.google.dev
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-4.8-flash"
 
 RSS_FEEDS = {
     "Crypto (CoinDesk)": "https://www.coindesk.com/arc/outboundfeeds/rss/",
