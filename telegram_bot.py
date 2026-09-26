@@ -1,3 +1,4 @@
+import html
 import os
 from datetime import datetime, timezone
 
@@ -7,16 +8,19 @@ import yfinance as yf
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # opsional; kalau kosong, skip AI summary
 
-# Sumber berita RSS (gratis, tanpa API key)
+# Ganti nama model ini kalau suatu saat error "model not found" —
+# cek daftar model terbaru di https://ai.google.dev
+GEMINI_MODEL = "gemini-2.5-flash"
+
 RSS_FEEDS = {
-    "🪙 Crypto (CoinDesk)": "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "📈 Stock News (MarketWatch)": "https://feeds.marketwatch.com/marketwatch/topstories/",
-    "🌍 Economic News (Investing.com)": "https://www.investing.com/rss/news_301.rss",
+    "Crypto (CoinDesk)": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Stock News (MarketWatch)": "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "Economic News (Investing.com)": "https://www.investing.com/rss/news_301.rss",
 }
-NEWS_PER_FEED = 3
+NEWS_PER_FEED = 4
 
-# Ticker market yang dipantau (via Yahoo Finance, gratis)
 MARKET_TICKERS = {
     "🟡 XAU/USD (Gold)": "XAUUSD=X",
     "📊 Nasdaq Composite": "^IXIC",
@@ -28,9 +32,13 @@ def get_news(feed_url, limit=NEWS_PER_FEED):
     feed = feedparser.parse(feed_url)
     items = []
     for entry in feed.entries[:limit]:
-        title = entry.title.strip()
-        link = entry.link.strip()
-        items.append(f'• <a href="{link}">{title}</a>')
+        items.append(
+            {
+                "title": entry.title.strip(),
+                "link": entry.link.strip(),
+                "summary": getattr(entry, "summary", "").strip(),
+            }
+        )
     return items
 
 
@@ -53,19 +61,62 @@ def get_market_data():
     return lines
 
 
+def summarize_with_gemini(all_news_by_category):
+    if not GEMINI_API_KEY:
+        return None
+
+    prompt_parts = ["Rangkum berita-berita ekonomi/finansial berikut ke dalam Bahasa Indonesia, "
+                    "dikelompokkan per kategori, singkat dan padat (maks 2-3 kalimat per kategori), "
+                    "gaya bahasa netral seperti berita, TANPA markdown/HTML, TANPA tanda bintang:\n"]
+    for category, items in all_news_by_category.items():
+        prompt_parts.append(f"\n[{category}]")
+        for item in items:
+            snippet = item["summary"][:200] if item["summary"] else ""
+            prompt_parts.append(f"- {item['title']}. {snippet}")
+
+    prompt = "\n".join(prompt_parts)
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        return f"(Gagal generate summary AI: {e})"
+
+
 def build_message():
     now = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
+    news_by_category = {name: get_news(url) for name, url in RSS_FEEDS.items()}
+
     parts = [f"<b>📊 Ringkasan Ekonomi &amp; Market</b>\n<i>{now}</i>\n"]
 
     parts.append("<b>💹 Pergerakan Market</b>")
     parts.append("\n".join(get_market_data()))
-    parts.append("")  # spacer
+    parts.append("")
 
-    for section, url in RSS_FEEDS.items():
-        parts.append(f"<b>{section}</b>")
-        news_items = get_news(url)
-        parts.append("\n".join(news_items) if news_items else "Tidak ada berita baru.")
-        parts.append("")  # spacer
+    ai_summary = summarize_with_gemini(news_by_category)
+    if ai_summary:
+        parts.append("<b>🧠 Rangkuman AI</b>")
+        parts.append(html.escape(ai_summary))
+        parts.append("")
+
+    for category, items in news_by_category.items():
+        parts.append(f"<b>🔗 {html.escape(category)}</b>")
+        if items:
+            for item in items:
+                title = html.escape(item["title"])
+                link = item["link"]
+                parts.append(f'• <a href="{link}">{title}</a>')
+        else:
+            parts.append("Tidak ada berita baru.")
+        parts.append("")
 
     return "\n".join(parts).strip()
 
@@ -84,5 +135,5 @@ def send_telegram_message(text):
 
 if __name__ == "__main__":
     message = build_message()
-    # Telegram batasi 4096 karakter per pesan; potong kalau kepanjangan
     send_telegram_message(message[:4096])
+    
