@@ -5,11 +5,11 @@ from datetime import datetime, timezone
 
 import feedparser
 import requests
-import yfinance as yf
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # opsional; kalau kosong, skip AI summary
+TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 
 # Ganti nama model ini kalau suatu saat error "model not found" —
 # cek daftar model terbaru di https://ai.google.dev
@@ -29,10 +29,13 @@ RSS_FEEDS = {
 }
 NEWS_PER_FEED = 3
 
+# NAS100/MNQ gak ada sebagai simbol langsung di Twelve Data (itu penamaan
+# khusus broker CFD/futures) — NDX (indeks Nasdaq-100 resmi) ngikutin
+# pergerakan yang sama persis, jadi dipakai sebagai gantinya.
 MARKET_TICKERS = {
-    "🟡 XAU/USD (Gold)": "XAUUSD=X",
-    "📊 Nasdaq Composite": "^IXIC",
-    "📉 Dow Jones": "^DJI",
+    "🟡 XAU/USD (Gold)": "XAU/USD",
+    "📊 Nasdaq 100 (NDX)": "NDX",
+    "📉 Dow Jones (DJI)": "DJI",
 }
 
 TELEGRAM_MAX_CHARS = 3500  # dikasih margin dari limit asli 4096
@@ -53,34 +56,48 @@ def get_news(feed_url, limit=NEWS_PER_FEED):
 
 
 def get_market_data():
+    """Ambil data dari Twelve Data. Return (lines_untuk_pesan, data_mentah_untuk_ai)."""
     lines = []
-    for name, ticker in MARKET_TICKERS.items():
+    raw = {}
+    for name, symbol in MARKET_TICKERS.items():
+        url = "https://api.twelvedata.com/quote"
+        params = {"symbol": symbol, "apikey": TWELVE_DATA_API_KEY}
         try:
-            # period 5 hari biar tetap ada data walau lagi weekend/libur bursa
-            data = yf.Ticker(ticker).history(period="5d")
-            if len(data) >= 2:
-                prev_close = float(data["Close"].iloc[-2])
-                last_price = float(data["Close"].iloc[-1])
-                change = last_price - prev_close
-                pct = (change / prev_close) * 100
-                arrow = "🟢" if change >= 0 else "🔴"
-                lines.append(f"{name}: {last_price:,.2f} {arrow} ({pct:+.2f}%)")
-            else:
-                lines.append(f"{name}: data tidak tersedia saat ini")
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+            if "close" not in data:
+                err_msg = data.get("message", "data tidak tersedia")
+                lines.append(f"{name}: gagal ambil data ({err_msg})")
+                continue
+
+            close = float(data["close"])
+            pct = float(data.get("percent_change", 0))
+            arrow = "🟢" if pct >= 0 else "🔴"
+            lines.append(f"{name}: {close:,.2f} {arrow} ({pct:+.2f}%)")
+            raw[name] = {"price": close, "percent_change": pct}
         except Exception as e:
             lines.append(f"{name}: gagal ambil data ({e})")
-    return lines
+    return lines, raw
 
 
-def summarize_with_gemini(all_news_by_category):
+def summarize_with_gemini(all_news_by_category, market_raw):
     if not GEMINI_API_KEY:
         return None
 
-    prompt_parts = [
-        "Rangkum berita-berita ekonomi/finansial berikut ke dalam Bahasa Indonesia, "
-        "dikelompokkan per kategori, singkat dan padat (maks 2-3 kalimat per kategori), "
-        "gaya bahasa netral seperti berita, TANPA markdown/HTML, TANPA tanda bintang:\n"
+    market_lines = [
+        f"- {name}: {info['price']:,.2f} ({info['percent_change']:+.2f}%)"
+        for name, info in market_raw.items()
     ]
+
+    prompt_parts = [
+        "Kamu adalah asisten analisa ekonomi. Berdasarkan data pergerakan market "
+        "dan berita berikut, buat dalam Bahasa Indonesia, TANPA markdown/HTML, TANPA tanda bintang:\n"
+        "1) Analisa singkat (2-3 kalimat) kemungkinan alasan pergerakan market berdasarkan berita yang ada.\n"
+        "2) Rangkuman tiap kategori berita, singkat dan padat (maks 2-3 kalimat per kategori).\n",
+        "\n[Data Market]",
+    ]
+    prompt_parts.extend(market_lines)
+
     for category, items in all_news_by_category.items():
         prompt_parts.append(f"\n[{category}]")
         for item in items:
@@ -104,26 +121,25 @@ def summarize_with_gemini(all_news_by_category):
             return data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except Exception as e:
             last_error = e
-            # 503/429 biasanya cuma server lagi sibuk sesaat -> coba lagi
             if attempt < GEMINI_MAX_RETRIES:
                 time.sleep(GEMINI_RETRY_DELAY_SECONDS)
 
     print(f"Gemini gagal setelah {GEMINI_MAX_RETRIES}x percobaan: {last_error}")
-    return None  # skip bagian AI summary daripada nampilin error mentah ke user
+    return None
 
 
 def build_message_blocks():
     now = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
     news_by_category = {name: get_news(url) for name, url in RSS_FEEDS.items()}
+    market_lines, market_raw = get_market_data()
 
     blocks = [f"<b>📊 Ringkasan Ekonomi &amp; Market</b>\n<i>{now}</i>"]
 
-    market_block = "<b>💹 Pergerakan Market</b>\n" + "\n".join(get_market_data())
-    blocks.append(market_block)
+    blocks.append("<b>💹 Pergerakan Market</b>\n" + "\n".join(market_lines))
 
-    ai_summary = summarize_with_gemini(news_by_category)
+    ai_summary = summarize_with_gemini(news_by_category, market_raw)
     if ai_summary:
-        blocks.append("<b>🧠 Rangkuman AI</b>\n" + html.escape(ai_summary))
+        blocks.append("<b>🧠 Analisa &amp; Rangkuman AI</b>\n" + html.escape(ai_summary))
 
     for category, items in news_by_category.items():
         lines = [f"<b>🔗 {html.escape(category)}</b>"]
